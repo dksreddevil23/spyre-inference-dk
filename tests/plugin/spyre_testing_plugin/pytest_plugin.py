@@ -62,6 +62,7 @@ from __future__ import annotations
 
 import atexit
 import fnmatch
+import functools
 import math
 import os
 import re
@@ -1197,6 +1198,57 @@ def patch_backend_list(request, monkeypatch):
     monkeypatch.setattr(test_module, "run_attention_backend", patched_run_attention_backend)
 
     yield
+
+
+@functools.cache
+def _gated_models(registry: Path) -> frozenset[str]:
+    """Gated repos, from the registry CI uses to pre-cache them (empty if absent)."""
+    if not registry.is_file():
+        return frozenset()
+    entries = yaml.safe_load(registry.read_text()).get("gated_models") or []
+    return frozenset(e["repo"] if isinstance(e, dict) else e for e in entries)
+
+
+@functools.cache
+def _no_access_reason(repo: str) -> str | None:
+    """Why a gated `repo` cannot be loaded, or None when it can.
+
+    A snapshot already on disk needs no token; otherwise the ambient HF token
+    (`HF_TOKEN` or cached login) must have access.
+    """
+    from huggingface_hub import HfApi, constants
+    from huggingface_hub.errors import GatedRepoError, RepositoryNotFoundError
+
+    snapshots = Path(constants.HF_HUB_CACHE) / f"models--{repo.replace('/', '--')}" / "snapshots"
+    if any(snapshots.glob("*")):
+        return None
+    try:
+        HfApi().auth_check(repo)
+    except (GatedRepoError, RepositoryNotFoundError) as e:
+        return f"gated model {repo} is not cached and HF_TOKEN gives no access ({type(e).__name__})"
+    return None
+
+
+def _param_strings(value):
+    if isinstance(value, str):
+        yield value
+    elif isinstance(value, (tuple, list)):
+        for v in value:
+            yield from _param_strings(v)
+
+
+@pytest.hookimpl(tryfirst=True)
+def pytest_runtest_setup(item):
+    """Skip a test parametrized over a gated model the host can't load."""
+    callspec = getattr(item, "callspec", None)
+    if callspec is None:
+        return
+    root = Path(item.config.inipath).parent if item.config.inipath else Path(item.config.rootdir)
+    gated = _gated_models(root / ".github" / "cache_config" / "hf_models_and_datasets.yaml")
+    for value in callspec.params.values():
+        for name in _param_strings(value):
+            if name in gated and (reason := _no_access_reason(name)):
+                pytest.skip(reason)
 
 
 @pytest.hookimpl(tryfirst=True)
